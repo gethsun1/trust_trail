@@ -42,16 +42,6 @@ async function submit(ix, signers) {
   return signature;
 }
 
-async function submitAndExpectOnChainFailure(ix, signers) {
-  const transaction = new Transaction().add(ix);
-  transaction.feePayer = signers[0].publicKey;
-  transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  transaction.sign(...signers);
-  const signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
-  const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-  assert.notEqual(confirmation.value.err, null, 'transaction should fail on the validator');
-}
-
 async function reject(ix, signers, description = 'instruction should fail') {
   await assert.rejects(submit(ix, signers), undefined, description);
 }
@@ -248,11 +238,57 @@ test('an expired mandate rejects agent payments', async () => {
   assert.equal((await state(f)).revoked, false);
 });
 
-test('a transaction rejected after transfer CPI leaves nonce, spending, and vault unchanged', async () => {
+test('a later instruction failure rolls back a successful payment CPI and all payment effects', async () => {
   const f = await fixture({ fund: 10_000_000n });
   const before = await state(f);
-  await submitAndExpectOnChainFailure(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(1)]), [f.agent]);
+  const recipientBefore = BigInt(await connection.getBalance(f.approvedRecipient));
+  const paymentIx = instruction('execute_payment', f.paymentAccounts, [u64(1), u64(before.nonce)]);
+  const lateRecipient = Keypair.generate().publicKey;
+  const failingIx = SystemProgram.transfer({
+    fromPubkey: f.agent.publicKey,
+    toPubkey: lateRecipient,
+    lamports: 1_000_000_000,
+  });
+  const transaction = new Transaction().add(paymentIx, failingIx);
+  transaction.feePayer = f.agent.publicKey;
+  transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  transaction.sign(f.agent);
+  const signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
+  const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+  assert.notEqual(confirmation.value.err, null, 'second instruction should fail on the validator');
+
+  let metadata = null;
+  for (let attempt = 0; attempt < 10 && metadata === null; attempt += 1) {
+    metadata = await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+    if (metadata === null) await delay(200);
+  }
+  assert(metadata?.meta, 'failed transaction metadata should be available');
+  assert.equal(metadata.meta.err?.InstructionError?.[0], 1, 'transaction should fail at the second instruction');
+  assert.deepEqual(metadata.meta.err?.InstructionError?.[1], { Custom: 1 },
+    'second System Program transfer should fail for insufficient funds');
+  const accountKeys = metadata.transaction.message.accountKeys;
+  const instructions = metadata.transaction.message.instructions;
+  assert.equal(accountKeys[instructions[0].programIdIndex].toBase58(), programId.toBase58());
+  assert.equal(accountKeys[instructions[1].programIdIndex].toBase58(), systemId.toBase58());
+  assert(metadata.meta.innerInstructions?.some((group) => group.index === 0 && group.instructions.length > 0),
+    'payment instruction should contain its System Program transfer CPI');
+  const logs = metadata.meta.logMessages ?? [];
+  const cpiSucceeded = logs.indexOf(`Program ${systemId.toBase58()} success`);
+  const paymentSucceeded = logs.indexOf(`Program ${programId.toBase58()} success`);
+  const laterTransferInvoked = logs.findIndex((line, index) => index > paymentSucceeded &&
+    line === `Program ${systemId.toBase58()} invoke [1]`);
+  const laterTransferFailed = logs.findIndex((line, index) => index > laterTransferInvoked &&
+    line.startsWith(`Program ${systemId.toBase58()} failed:`));
+  assert(cpiSucceeded >= 0, 'payment CPI should complete successfully');
+  assert(paymentSucceeded > cpiSucceeded, 'payment instruction should complete after its successful CPI');
+  assert(paymentSucceeded >= 0, 'payment program instruction should complete successfully');
+  assert(laterTransferInvoked > paymentSucceeded, 'second System Program instruction should run after payment succeeds');
+  assert(laterTransferFailed > laterTransferInvoked, 'second System Program instruction should fail');
+  assert(logs.some((line) => line.includes('Transfer: insufficient lamports')),
+    'validator logs should identify the second transfer as exceeding the agent balance');
+
   assert.deepEqual(await state(f), before);
+  assert.equal(BigInt(await connection.getBalance(f.approvedRecipient)), recipientBefore);
 });
 
 test('maximum lamport amount does not overflow and fails on available balance', async () => {
