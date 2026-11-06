@@ -1,31 +1,27 @@
+# Local environment and credentials
 .env
 .env.*
 !.env.example
+*.secret
+secrets/
 *.pem
 *.key
 id.json
 *-keypair.json
-node_modules/
-target/
-.anchor/
-test-ledger/
-.DS_Store
-# Rust / Anchor build artifacts
-**/target/
-.anchor/
-.test-ledger/
-node_modules/
-
-# Local validator data and generated key material
-ledger/
-*.json.tmp
+*-wallet.json
+wallet.json
 *.seed
 *.mnemonic
 
-# Local environment and credentials
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-*.secret
-secrets/
+# Rust and Anchor build outputs, validator data, and generated local keys
+target/
+**/target/
+.anchor/
+.test-ledger/
+test-ledger/
+ledger/
+
+# JavaScript dependencies and local files
+node_modules/
+*.json.tmp
+.DS_Store

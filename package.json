@@ -1,0 +1,12 @@
+{
+  "name": "tr-mandate",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test:anchor": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@solana/web3.js": "1.99.0"
+  }
+}
