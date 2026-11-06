@@ -83,7 +83,7 @@ pub mod tr_mandate {
         let now = Clock::get()?.unix_timestamp;
         let mandate = &mut ctx.accounts.mandate;
         require!(!mandate.revoked, MandateError::Revoked);
-        require!(now <= mandate.expires_at, MandateError::Expired);
+        require!(is_unexpired(now, mandate.expires_at), MandateError::Expired);
         require_keys_eq!(
             ctx.accounts.recipient.key(),
             mandate.recipient,
@@ -97,11 +97,8 @@ pub mod tr_mandate {
         require!(expected_nonce == mandate.nonce, MandateError::InvalidNonce);
 
         let today = utc_day(now);
-        let current_spent = if today == mandate.day_index {
-            mandate.spent_today
-        } else {
-            0
-        };
+        let (effective_day, current_spent) =
+            daily_state_for_day(mandate.day_index, mandate.spent_today, today);
         let next_spent = checked_add(current_spent, amount)?;
         require!(next_spent <= mandate.daily_limit, MandateError::DailyLimit);
         let next_nonce = checked_add(mandate.nonce, 1)?;
@@ -126,7 +123,7 @@ pub mod tr_mandate {
         )?;
 
         mandate.spent_today = next_spent;
-        mandate.day_index = today;
+        mandate.day_index = effective_day;
         mandate.nonce = next_nonce;
         Ok(())
     }
@@ -168,10 +165,21 @@ pub mod tr_mandate {
         mandate.max_per_tx = max_per_tx;
         mandate.daily_limit = daily_limit;
         mandate.expires_at = expires_at;
-        mandate.spent_today = 0;
-        mandate.day_index = utc_day(now);
-        mandate.revoked = false;
+        let (effective_day, current_spent) =
+            daily_state_for_day(mandate.day_index, mandate.spent_today, utc_day(now));
+        mandate.day_index = effective_day;
+        mandate.spent_today = current_spent;
         mandate.nonce = checked_add(mandate.nonce, 1)?;
+        Ok(())
+    }
+
+    pub fn reactivate_agent(ctx: Context<OwnerMandate>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let mandate = &mut ctx.accounts.mandate;
+        require!(mandate.revoked, MandateError::NotRevoked);
+        require!(is_unexpired(now, mandate.expires_at), MandateError::Expired);
+        mandate.nonce = checked_add(mandate.nonce, 1)?;
+        mandate.revoked = false;
         Ok(())
     }
 }
@@ -198,6 +206,19 @@ fn validate_policy(
 
 fn utc_day(unix_timestamp: i64) -> i64 {
     unix_timestamp.div_euclid(DAY_SECONDS)
+}
+
+fn is_unexpired(now: i64, expires_at: i64) -> bool {
+    now < expires_at
+}
+
+fn daily_state_for_day(stored_day: i64, spent: u64, current_day: i64) -> (i64, u64) {
+    if current_day > stored_day {
+        (current_day, 0)
+    } else {
+        // Never restore an earlier day's allowance if the cluster clock moves backward.
+        (stored_day, spent)
+    }
 }
 
 fn checked_add(left: u64, right: u64) -> Result<u64> {
@@ -330,6 +351,8 @@ pub enum MandateError {
     ArithmeticOverflow,
     #[msg("Invalid mandate policy")]
     InvalidPolicy,
+    #[msg("Mandate is not revoked")]
+    NotRevoked,
 }
 
 #[cfg(test)]
@@ -350,9 +373,48 @@ mod tests {
     }
 
     #[test]
+    fn expiry_boundary_is_exclusive() {
+        assert!(is_unexpired(99, 100));
+        assert!(!is_unexpired(100, 100));
+        assert!(!is_unexpired(101, 100));
+    }
+
+    #[test]
+    fn spending_rolls_over_at_utc_midnight_only() {
+        let before_midnight = 86_399;
+        let midnight = 86_400;
+        let after_midnight = 86_401;
+
+        assert_eq!(utc_day(before_midnight), 0);
+        assert_eq!(
+            daily_state_for_day(0, 55, utc_day(before_midnight)),
+            (0, 55)
+        );
+        assert_eq!(utc_day(midnight), 1);
+        assert_eq!(daily_state_for_day(0, 55, utc_day(midnight)), (1, 0));
+        assert_eq!(utc_day(after_midnight), 1);
+        assert_eq!(daily_state_for_day(1, 13, utc_day(after_midnight)), (1, 13));
+        assert_eq!(
+            daily_state_for_day(1, 13, utc_day(before_midnight)),
+            (1, 13)
+        );
+    }
+
+    #[test]
+    fn policy_change_keeps_same_day_spend_but_rollover_clears_it() {
+        assert_eq!(daily_state_for_day(20, 70, 20), (20, 70));
+        assert_eq!(daily_state_for_day(20, 70, 21), (21, 0));
+        // Repeated same-day updates invoke the same pure transition and cannot clear spend.
+        let state = daily_state_for_day(20, 70, 20);
+        assert_eq!(daily_state_for_day(state.0, state.1, 20), (20, 70));
+    }
+
+    #[test]
     fn checked_arithmetic_rejects_overflow_and_reserve_underflow() {
         assert!(checked_add(u64::MAX, 1).is_err());
+        assert_eq!(checked_add(u64::MAX, 0).unwrap(), u64::MAX);
         assert!(spendable_balance(9, 10).is_err());
         assert_eq!(spendable_balance(10, 10).unwrap(), 0);
+        assert_eq!(spendable_balance(u64::MAX, 0).unwrap(), u64::MAX);
     }
 }

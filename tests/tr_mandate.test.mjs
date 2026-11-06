@@ -1,20 +1,19 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 
-const endpoint = 'http://127.0.0.1:8899';
-const connection = new Connection(endpoint, 'confirmed');
-const owner = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync('target/test-wallet.json', 'utf8'))));
+const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
 const idl = JSON.parse(readFileSync('target/idl/tr_mandate.json', 'utf8'));
 const programId = new PublicKey(idl.address);
 const systemId = SystemProgram.programId;
-let SYSTEM_RENT = 890_880n;
+const clockSysvar = new PublicKey('SysvarC1ock11111111111111111111111111111111');
+const U64_MAX = (1n << 64n) - 1n;
 
 const u64 = (value) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; };
 const i64 = (value) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(value)); return b; };
 const keyBytes = (key) => new PublicKey(key).toBuffer();
-const discriminator = (name) => Buffer.from(idl.instructions.find((ix) => ix.name === name).discriminator);
 
 function derive(ownerKey) {
   const [mandate] = PublicKey.findProgramAddressSync([Buffer.from('mandate'), keyBytes(ownerKey)], programId);
@@ -33,102 +32,232 @@ function instruction(name, accounts, args = []) {
   return { programId, keys, data: Buffer.concat([Buffer.from(spec.discriminator), ...args]) };
 }
 
-async function submit(ix, signers = [owner]) {
+async function submit(ix, signers) {
   const transaction = new Transaction().add(ix);
   transaction.feePayer = signers[0].publicKey;
   transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
   transaction.sign(...signers);
-  return connection.sendRawTransaction(transaction.serialize(), { skipPreflight: false }).then(async (signature) => {
-    await connection.confirmTransaction(signature, 'confirmed');
-    return signature;
-  });
+  const signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: false });
+  await connection.confirmTransaction(signature, 'confirmed');
+  return signature;
 }
 
-async function rejects(ix, signers, pattern) {
-  await assert.rejects(submit(ix, signers), pattern);
+async function submitAndExpectOnChainFailure(ix, signers) {
+  const transaction = new Transaction().add(ix);
+  transaction.feePayer = signers[0].publicKey;
+  transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  transaction.sign(...signers);
+  const signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
+  const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+  assert.notEqual(confirmation.value.err, null, 'transaction should fail on the validator');
 }
 
-test('local validator enforces mandate authorization, limits, nonce and vault reserve', async (t) => {
-  const health = await connection.getVersion();
-  assert.ok(health['solana-core']);
-  SYSTEM_RENT = BigInt(await connection.getMinimumBalanceForRentExemption(0));
+async function reject(ix, signers, description = 'instruction should fail') {
+  await assert.rejects(submit(ix, signers), undefined, description);
+}
+
+async function airdrop(key, lamports = 2_000_000_000) {
+  const publicKey = key.publicKey ?? key;
+  const signature = await connection.requestAirdrop(publicKey, lamports);
+  await connection.confirmTransaction(signature, 'confirmed');
+}
+
+async function validatorTimestamp() {
+  const info = await connection.getAccountInfo(clockSysvar);
+  assert(info, 'validator Clock sysvar should be available');
+  return info.data.readBigInt64LE(32);
+}
+
+async function fixture({ fund = 0n, maxPerTx = 100_000_000n, dailyLimit = 150_000_000n, recipient, expirySeconds = 600 } = {}) {
+  const owner = Keypair.generate();
   const agent = Keypair.generate();
   const rogue = Keypair.generate();
-  const recipient = Keypair.generate().publicKey;
-  const wrongRecipient = Keypair.generate().publicKey;
+  await Promise.all([airdrop(owner), airdrop(agent, 500_000_000), airdrop(rogue, 500_000_000)]);
   const { mandate, vault } = derive(owner.publicKey);
-  const expiry = BigInt(Math.floor(Date.now() / 1000) + 600);
-  const initAccounts = { owner: owner.publicKey, mandate, vault, system_program: systemId };
-  await submit(instruction('initialize_mandate', initAccounts, [keyBytes(agent.publicKey), keyBytes(recipient), u64(100_000_000), u64(150_000_000), i64(expiry)]));
+  const approvedRecipient = recipient ?? Keypair.generate().publicKey;
+  const expiresAt = (await validatorTimestamp()) + BigInt(expirySeconds);
+  await submit(instruction('initialize_mandate', {
+    owner: owner.publicKey, mandate, vault, system_program: systemId,
+  }, [keyBytes(agent.publicKey), keyBytes(approvedRecipient), u64(maxPerTx), u64(dailyLimit), i64(expiresAt)]), [owner]);
+  const accounts = { owner: owner.publicKey, mandate, vault, system_program: systemId };
+  if (fund > 0n) await submit(instruction('deposit', accounts, [u64(fund)]), [owner]);
+  const paymentAccounts = { agent: agent.publicKey, mandate, recipient: approvedRecipient, vault, system_program: systemId };
+  return { owner, agent, rogue, mandate, vault, approvedRecipient, expiresAt, accounts, paymentAccounts };
+}
 
-  const mandateInfo = await connection.getAccountInfo(mandate);
-  const vaultInfo = await connection.getAccountInfo(vault);
+async function state(f) {
+  const info = await connection.getAccountInfo(f.mandate);
+  assert(info, 'mandate account should exist');
+  const data = info.data;
+  return {
+    spentToday: data.readBigUInt64LE(120),
+    dayIndex: data.readBigInt64LE(128),
+    nonce: data.readBigUInt64LE(144),
+    revoked: data[152] === 1,
+    vaultLamports: BigInt(await connection.getBalance(f.vault)),
+  };
+}
+
+test('initialization derives the mandate and creates a system-owned zero-data rent-exempt vault', async () => {
+  const f = await fixture();
+  const mandateInfo = await connection.getAccountInfo(f.mandate);
+  const vaultInfo = await connection.getAccountInfo(f.vault);
   assert.equal(mandateInfo.owner.toBase58(), programId.toBase58());
   assert.equal(mandateInfo.data.length, 154);
   assert.equal(vaultInfo.owner.toBase58(), systemId.toBase58());
   assert.equal(vaultInfo.data.length, 0);
-  assert.equal(vaultInfo.lamports, Number(SYSTEM_RENT));
-  assert.equal(derive(owner.publicKey).mandate.toBase58(), mandate.toBase58());
+  assert.equal(vaultInfo.lamports, await connection.getMinimumBalanceForRentExemption(0));
+  assert.deepEqual(derive(f.owner.publicKey), { mandate: f.mandate, vault: f.vault });
+});
 
-  const agentBalance = await connection.getBalance(agent.publicKey);
-  const airdrop = await connection.requestAirdrop(agent.publicKey, 1_000_000_000);
-  await connection.confirmTransaction(airdrop, 'confirmed');
-  const rogueDrop = await connection.requestAirdrop(rogue.publicKey, 1_000_000_000);
-  await connection.confirmTransaction(rogueDrop, 'confirmed');
-  assert.equal(agentBalance, 0);
+test('initialization and policy updates reject expired timestamps without changing mandate state', async () => {
+  const owner = Keypair.generate();
+  const agent = Keypair.generate();
+  const recipient = Keypair.generate().publicKey;
+  await Promise.all([airdrop(owner), airdrop(agent)]);
+  const { mandate, vault } = derive(owner.publicKey);
+  await reject(instruction('initialize_mandate', {
+    owner: owner.publicKey, mandate, vault, system_program: systemId,
+  }, [keyBytes(agent.publicKey), keyBytes(recipient), u64(100), u64(100), i64(0)]), [owner], 'expired initialization policy');
+  assert.equal(await connection.getAccountInfo(mandate), null);
 
-  await submit(instruction('deposit', { owner: owner.publicKey, mandate, vault, system_program: systemId }, [u64(1_000_000_000)]));
-  const paymentAccounts = { agent: agent.publicKey, mandate, recipient, vault, system_program: systemId };
-  const snapshot = async () => {
-    const data = (await connection.getAccountInfo(mandate)).data;
-    return { spent: data.readBigUInt64LE(8 + 32 * 3 + 8 * 2), nonce: data.readBigUInt64LE(8 + 32 * 3 + 8 * 5), vault: await connection.getBalance(vault) };
-  };
-  const beforeRejected = await snapshot();
+  const f = await fixture();
+  const before = await state(f);
+  await reject(instruction('update_mandate', { owner: f.owner.publicKey, mandate: f.mandate }, [
+    keyBytes(f.agent.publicKey), keyBytes(f.approvedRecipient), u64(100), u64(100), i64(0),
+  ]), [f.owner], 'expired updated policy');
+  assert.deepEqual(await state(f), before);
+});
 
-  await rejects(instruction('execute_payment', { ...paymentAccounts, recipient: wrongRecipient }, [u64(1), u64(0)]), [agent], /custom program error|Recipient|Error/);
-  await rejects(instruction('execute_payment', { ...paymentAccounts, vault: Keypair.generate().publicKey }, [u64(1), u64(0)]), [agent], /custom program error|Constraint|Error/);
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(0), u64(0)]), [agent], /custom program error|Amount|Error/);
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(100_000_001), u64(0)]), [agent], /custom program error|limit|Error/);
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(1), u64(0)]), [agent], /custom program error|nonce|Error/);
-  const afterRejected = await snapshot();
-  assert.deepEqual(afterRejected, beforeRejected, 'failed payments must not mutate nonce, spending, or vault balance');
+test('authorized agent payment transfers only to the approved recipient', async () => {
+  const f = await fixture({ fund: 1_000_000_000n });
+  const recipientBefore = BigInt(await connection.getBalance(f.approvedRecipient));
+  const reserve = BigInt(await connection.getMinimumBalanceForRentExemption(0));
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(25_000_000), u64(1)]), [f.agent]);
+  const after = await state(f);
+  assert.equal(BigInt(await connection.getBalance(f.approvedRecipient)), recipientBefore + 25_000_000n);
+  assert.equal(after.spentToday, 25_000_000n);
+  assert.equal(after.nonce, 2n);
+  assert.ok(after.vaultLamports >= reserve);
+});
 
-  await submit(instruction('execute_payment', paymentAccounts, [u64(60_000_000), u64(1)]), [agent]);
-  const afterPayment = await snapshot();
-  assert.equal(afterPayment.spent, 60_000_000n);
-  assert.equal(afterPayment.nonce, 2n);
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(100_000_000), u64(2)]), [agent], /custom program error|allowance|Error/);
-  await rejects(instruction('execute_payment', { ...paymentAccounts, agent: rogue.publicKey }, [u64(1), u64(2)]), [rogue], /custom program error|Constraint|Error/);
-  assert.deepEqual(await snapshot(), afterPayment);
+test('agent, recipient, PDA, amount, limit, and nonce failures preserve payment state', async () => {
+  const f = await fixture({ fund: 1_000_000_000n });
+  const before = await state(f);
+  const badRecipient = { ...f.paymentAccounts, recipient: Keypair.generate().publicKey };
+  const badVault = { ...f.paymentAccounts, vault: Keypair.generate().publicKey };
+  const badAgent = { ...f.paymentAccounts, agent: f.rogue.publicKey };
+  await reject(instruction('execute_payment', badAgent, [u64(1), u64(1)]), [f.rogue], 'unauthorized agent');
+  await reject(instruction('execute_payment', badRecipient, [u64(1), u64(1)]), [f.agent], 'wrong recipient');
+  await reject(instruction('execute_payment', badVault, [u64(1), u64(1)]), [f.agent], 'substituted vault PDA');
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(0), u64(1)]), [f.agent], 'zero payment');
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(100_000_001), u64(1)]), [f.agent], 'per-transaction limit');
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(0)]), [f.agent], 'stale nonce');
+  assert.deepEqual(await state(f), before);
 
-  const ownerAccounts = { owner: owner.publicKey, mandate, vault, system_program: systemId };
-  const availableBeforeDrain = BigInt(await connection.getBalance(vault)) - SYSTEM_RENT;
-  await submit(instruction('withdraw', ownerAccounts, [u64(availableBeforeDrain)]));
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(1), u64(3)]), [agent], /custom program error|fund|Error/);
-  assert.equal((await snapshot()).spent, afterPayment.spent);
-  await submit(instruction('deposit', { owner: owner.publicKey, mandate, vault, system_program: systemId }, [u64(10_000_000)]));
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(100_000_000), u64(1)]), [f.agent]);
+  const afterAllowedPayment = await state(f);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(50_000_001), u64(2)]), [f.agent], 'daily limit');
+  assert.deepEqual(await state(f), afterAllowedPayment);
+});
 
-  await rejects(instruction('withdraw', { ...ownerAccounts, owner: rogue.publicKey }, [u64(1)]), [rogue], /custom program error|Constraint|Error/);
-  await rejects(instruction('update_mandate', { owner: rogue.publicKey, mandate }, [keyBytes(agent.publicKey), keyBytes(recipient), u64(100), u64(100), i64(expiry)]), [rogue], /custom program error|Constraint|Error/);
+test('policy updates and repeated same-day updates preserve accumulated spending', async () => {
+  const f = await fixture({ fund: 1_000_000_000n });
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(60_000_000), u64(1)]), [f.agent]);
+  const update = (max, daily) => instruction('update_mandate', { owner: f.owner.publicKey, mandate: f.mandate }, [
+    keyBytes(f.agent.publicKey), keyBytes(f.approvedRecipient), u64(max), u64(daily), i64(f.expiresAt),
+  ]);
+  await submit(update(90_000_000n, 120_000_000n), [f.owner]);
+  assert.equal((await state(f)).spentToday, 60_000_000n);
+  await submit(update(80_000_000n, 100_000_000n), [f.owner]);
+  const afterRepeatedUpdate = await state(f);
+  assert.equal(afterRepeatedUpdate.spentToday, 60_000_000n);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(40_000_001), u64(afterRepeatedUpdate.nonce)]), [f.agent], 'updated policy cannot reset daily allowance');
+  assert.deepEqual(await state(f), afterRepeatedUpdate);
+});
 
-  await submit(instruction('update_mandate', { owner: owner.publicKey, mandate }, [keyBytes(agent.publicKey), keyBytes(recipient), u64(100_000_000), u64(150_000_000), i64(expiry)]));
-  const updated = await snapshot();
-  assert.equal(updated.spent, 0n);
-  assert.equal(updated.nonce, 5n);
+test('revocation persists through policy edits and only explicit owner reactivation restores agent authority', async () => {
+  const f = await fixture({ fund: 1_000_000_000n });
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(10_000_000), u64(1)]), [f.agent]);
+  await submit(instruction('revoke_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  const revoked = await state(f);
+  assert.equal(revoked.revoked, true);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(revoked.nonce)]), [f.agent], 'revoked agent');
+  await reject(instruction('reactivate_agent', { owner: f.rogue.publicKey, mandate: f.mandate }), [f.rogue], 'only owner can reactivate');
 
-  await submit(instruction('revoke_agent', { owner: owner.publicKey, mandate }));
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(1), u64(6)]), [agent], /custom program error|revoked|Error/);
+  await submit(instruction('update_mandate', { owner: f.owner.publicKey, mandate: f.mandate }, [
+    keyBytes(f.agent.publicKey), keyBytes(f.approvedRecipient), u64(100_000_000), u64(150_000_000), i64(f.expiresAt),
+  ]), [f.owner]);
+  const afterEdit = await state(f);
+  assert.equal(afterEdit.revoked, true);
+  assert.equal(afterEdit.spentToday, 10_000_000n);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(afterEdit.nonce)]), [f.agent], 'policy edit must not reactivate');
 
-  // The owner can recover spendable funds after revocation, while preserving rent.
-  const spendable = BigInt(await connection.getBalance(vault)) - SYSTEM_RENT;
-  assert.ok(spendable > 0n);
-  await submit(instruction('withdraw', ownerAccounts, [u64(spendable)]));
-  assert.equal(await connection.getBalance(vault), Number(SYSTEM_RENT));
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(1), u64(3)]), [agent], /custom program error|revoked|Error/);
+  await submit(instruction('reactivate_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  const reactivated = await state(f);
+  assert.equal(reactivated.revoked, false);
+  assert.equal(reactivated.spentToday, 10_000_000n);
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(reactivated.nonce)]), [f.agent]);
+  assert.equal((await state(f)).spentToday, 10_000_001n);
+});
 
-  const nearExpiry = BigInt(Math.floor(Date.now() / 1000) + 2);
-  await submit(instruction('update_mandate', { owner: owner.publicKey, mandate }, [keyBytes(agent.publicKey), keyBytes(recipient), u64(100_000_000), u64(150_000_000), i64(nearExpiry)]));
-  await new Promise((resolve) => setTimeout(resolve, 3_000));
-  await rejects(instruction('execute_payment', paymentAccounts, [u64(1), u64(8)]), [agent], /custom program error|expired|Error/);
-  t.diagnostic(`mandate=${mandate.toBase58()} vault=${vault.toBase58()}`);
+test('exact rent-reserve boundary is spendable only above reserve and owner can withdraw after revocation', async () => {
+  const f = await fixture({ fund: 1n });
+  const reserve = BigInt(await connection.getMinimumBalanceForRentExemption(0));
+  await airdrop(f.approvedRecipient, Number(reserve));
+  assert.equal((await state(f)).vaultLamports, reserve + 1n);
+  await submit(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(1)]), [f.agent]);
+  assert.equal((await state(f)).vaultLamports, reserve);
+  const afterPayment = await state(f);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(afterPayment.nonce)]), [f.agent], 'insufficient spendable funds at reserve');
+  assert.deepEqual(await state(f), afterPayment);
+
+  await submit(instruction('revoke_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  await reject(instruction('withdraw', f.accounts, [u64(0)]), [f.owner], 'zero withdrawal');
+  assert.equal((await state(f)).vaultLamports, reserve);
+});
+
+test('owner withdrawal drains only spendable balance and preserves the reserve', async () => {
+  const f = await fixture({ fund: 40_000_000n });
+  const reserve = BigInt(await connection.getMinimumBalanceForRentExemption(0));
+  await submit(instruction('revoke_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  await submit(instruction('withdraw', f.accounts, [u64(40_000_000)]), [f.owner]);
+  assert.equal((await state(f)).vaultLamports, reserve);
+  await reject(instruction('withdraw', f.accounts, [u64(1)]), [f.owner], 'withdrawal cannot consume reserve');
+  assert.equal((await state(f)).vaultLamports, reserve);
+  await reject(instruction('withdraw', { ...f.accounts, owner: f.rogue.publicKey }, [u64(1)]), [f.rogue], 'unauthorized withdrawal');
+  await reject(instruction('update_mandate', { owner: f.rogue.publicKey, mandate: f.mandate }, [
+    keyBytes(f.agent.publicKey), keyBytes(f.approvedRecipient), u64(10), u64(10), i64(f.expiresAt),
+  ]), [f.rogue], 'unauthorized policy update');
+});
+
+test('an expired mandate rejects agent payments', async () => {
+  const f = await fixture({ fund: 1_000_000n, expirySeconds: 8 });
+  while (await validatorTimestamp() < f.expiresAt) await delay(250);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(1)]), [f.agent], 'expired mandate');
+  assert.equal((await state(f)).spentToday, 0n);
+  await submit(instruction('revoke_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  const revoked = await state(f);
+  await reject(instruction('reactivate_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner], 'expired mandate requires policy extension');
+  assert.deepEqual(await state(f), revoked);
+  const extendedExpiry = (await validatorTimestamp()) + 600n;
+  await submit(instruction('update_mandate', { owner: f.owner.publicKey, mandate: f.mandate }, [
+    keyBytes(f.agent.publicKey), keyBytes(f.approvedRecipient), u64(100_000_000), u64(150_000_000), i64(extendedExpiry),
+  ]), [f.owner]);
+  await submit(instruction('reactivate_agent', { owner: f.owner.publicKey, mandate: f.mandate }), [f.owner]);
+  assert.equal((await state(f)).revoked, false);
+});
+
+test('a transaction rejected after transfer CPI leaves nonce, spending, and vault unchanged', async () => {
+  const f = await fixture({ fund: 10_000_000n });
+  const before = await state(f);
+  await submitAndExpectOnChainFailure(instruction('execute_payment', f.paymentAccounts, [u64(1), u64(1)]), [f.agent]);
+  assert.deepEqual(await state(f), before);
+});
+
+test('maximum lamport amount does not overflow and fails on available balance', async () => {
+  const f = await fixture({ fund: 1_000_000n, maxPerTx: U64_MAX, dailyLimit: U64_MAX });
+  const before = await state(f);
+  await reject(instruction('execute_payment', f.paymentAccounts, [u64(U64_MAX), u64(1)]), [f.agent], 'u64 maximum exceeds available vault funds');
+  assert.deepEqual(await state(f), before);
 });
