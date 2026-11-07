@@ -25,3 +25,7 @@ ledger/
 node_modules/
 *.json.tmp
 .DS_Store
+
+# Next.js and TypeScript build output
+.next/
+*.tsbuildinfo

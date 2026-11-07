@@ -4,9 +4,38 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test:anchor": "node --test tests/*.test.mjs"
+    "test:anchor": "node --test tests/*.test.mjs",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:local-integration": "vitest run tests/frontend/local.integration.test.ts"
   },
   "devDependencies": {
-    "@solana/web3.js": "1.99.0"
+    "@solana/web3.js": "1.99.0",
+    "@tailwindcss/postcss": "^4.1.17",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.39.1",
+    "eslint-config-next": "^16.4.5",
+    "fake-indexeddb": "^6.2.7",
+    "jsdom": "^27.2.0",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/wallet-adapter-react": "^0.15.40",
+    "@solana/wallet-standard-wallet-adapter-react": "^1.1.8",
+    "lucide-react": "^0.468.0",
+    "next": "^16.4.5",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "zod": "^4.6.6"
   }
 }
