@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { assessLendingOpportunity } from '../../../../lib/server/groq';
 import { readRequestBody } from '../../../../lib/server/http';
@@ -24,13 +25,15 @@ export async function POST(request: Request) {
     const raw = await readRequestBody(request, 3_000);
     if (raw === null) return NextResponse.json({ error: 'REQUEST_TOO_LARGE' }, { status: 413 });
     const input = inputSchema.parse(JSON.parse(raw));
-    const proposal = await assessLendingOpportunity(input);
+    const proposal = await assessLendingOpportunity({ ...input, proposalId: randomUUID() });
     return NextResponse.json({ proposal, authority: 'ADVISORY_ONLY', settlement: 'NOT_IMPLEMENTED' });
   } catch (error) {
     const code = error instanceof Error ? error.message : 'AI_ERROR';
     const known = ['AI_NOT_CONFIGURED', 'AI_MODEL_UNSUPPORTED', 'AI_RATE_LIMITED', 'AI_PROVIDER_ERROR', 'AI_TIMEOUT', 'AI_MALFORMED_RESPONSE', 'AI_AUTH_FAILED', 'AI_REQUEST_REJECTED', 'AI_SCHEMA_MISMATCH'];
-    console.error('Lending assessment failed:', known.includes(code) ? code : error instanceof z.ZodError ? 'INVALID_INPUT' : 'UNEXPECTED_ERROR');
+    const safeCode = /^AI_REQUEST_REJECTED_[A-Z0-9_]{1,40}$/.test(code) ? code : known.includes(code) ? code : error instanceof z.ZodError ? 'INVALID_INPUT' : 'UNEXPECTED_ERROR';
+    console.error('Lending assessment failed:', safeCode);
     const status = code === 'AI_NOT_CONFIGURED' || code === 'AI_MODEL_UNSUPPORTED' ? 503 : code === 'AI_RATE_LIMITED' ? 429 : error instanceof z.ZodError ? 400 : 502;
-    return NextResponse.json({ error: status === 429 ? 'RATE_LIMITED' : status === 503 ? 'AI_UNAVAILABLE' : status === 400 ? 'INVALID_INPUT' : 'ASSESSMENT_UNAVAILABLE' }, { status });
+    const errorCode = status === 429 ? 'RATE_LIMITED' : status === 503 ? 'AI_UNAVAILABLE' : status === 400 ? 'INVALID_INPUT' : /^AI_REQUEST_REJECTED_/.test(code) ? 'AI_REQUEST_REJECTED' : known.includes(code) ? code : 'ASSESSMENT_UNAVAILABLE';
+    return NextResponse.json({ error: errorCode }, { status });
   }
 }
