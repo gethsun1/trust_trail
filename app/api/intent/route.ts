@@ -26,7 +26,9 @@ export async function POST(request: Request) {
     const code = error instanceof Error ? error.message : 'AI_ERROR';
     const internalCode = /^AI_PROVIDER_HTTP_\d{3}$/.test(code) || /^AI_REQUEST_REJECTED_[A-Z0-9_]{1,40}$/.test(code) || ['AI_NOT_CONFIGURED', 'AI_MODEL_UNSUPPORTED', 'AI_RATE_LIMITED', 'AI_PROVIDER_ERROR', 'AI_TIMEOUT', 'AI_MALFORMED_RESPONSE', 'AI_AUTH_FAILED', 'AI_REQUEST_REJECTED', 'INVALID_RECIPIENT', 'INVALID_AMOUNT', 'INVALID_INTENT'].includes(code) ? code : 'UNEXPECTED_ERROR';
     console.error('Intent processing failed:', internalCode);
-    const status = code === 'AI_NOT_CONFIGURED' || code === 'AI_MODEL_UNSUPPORTED' ? 503 : code === 'AI_RATE_LIMITED' ? 429 : 502;
-    return NextResponse.json({ error: status === 429 ? 'RATE_LIMITED' : status === 503 ? 'AI_UNAVAILABLE' : 'INTENT_UNAVAILABLE' }, { status });
+    const invalidIntent = ['INVALID_RECIPIENT', 'INVALID_AMOUNT', 'INVALID_INTENT'].includes(code);
+    const status = code === 'AI_NOT_CONFIGURED' || code === 'AI_MODEL_UNSUPPORTED' ? 503 : code === 'AI_RATE_LIMITED' ? 429 : invalidIntent ? 422 : 502;
+    const errorCode = status === 429 ? 'RATE_LIMITED' : status === 503 ? 'AI_UNAVAILABLE' : invalidIntent ? 'INVALID_INTENT' : 'INTENT_UNAVAILABLE';
+    return NextResponse.json({ error: errorCode }, { status });
   }
 }

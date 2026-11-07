@@ -31,7 +31,13 @@ export function IntentFirewall({ record, agentPublic }: { record: MandateRecord;
     try {
       const response = await fetch('/api/intent', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ instruction }) });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Intent interpretation unavailable.');
+      if (!response.ok) {
+        const message = result.error === 'AI_UNAVAILABLE' ? 'AI interpretation is not configured or its model is unavailable.'
+          : result.error === 'RATE_LIMITED' ? 'Too many requests. Retry in a minute.'
+          : result.error === 'INVALID_INTENT' ? 'The interpreted request did not pass validation. Clarify the amount and recipient.'
+          : 'AI interpretation is temporarily unavailable. The request was not authorized.';
+        throw new Error(message);
+      }
       setIntent(result.intent); setToken(result.intentToken);
     } catch (e) { setError(e instanceof Error ? e.message : 'Intent interpretation unavailable.'); }
     finally { setBusy(false); }

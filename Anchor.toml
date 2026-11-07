@@ -5,6 +5,9 @@ solana_version = "4.1.2"
 [programs.localnet]
 tr_mandate = "7hucMRtxEjUYn9hbKPsByneQmmu4Qrv7qDgaVG59ryEY"
 
+[programs.devnet]
+tr_mandate = "7hucMRtxEjUYn9hbKPsByneQmmu4Qrv7qDgaVG59ryEY"
+
 [provider]
 cluster = "Localnet"
 wallet = "target/test-wallet.json"
