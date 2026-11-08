@@ -4,7 +4,7 @@
 
 Trust Trail is a Solana Devnet prototype for owner-controlled mandates and AI-assisted lending assessment. Its product direction is privacy-aware lending against tokenized equity: an AI agent may assess an opportunity, deterministic checks evaluate it against supplied policy evidence, and the owner retains control of supported on-chain actions.
 
-> **Prototype status:** The deployed program handles native SOL mandates and payments only. Tokenized-equity ownership verification, trusted valuation, liquidity, loan accounting, collateral locking, liquidation, repayment, and loan settlement are not implemented. Lending screen scenarios use local fixtures and must not be represented as live collateral or a real loan.
+> **Prototype status:** The M1 program controls native SOL only. Tokenized-equity lending eligibility, trusted valuation, liquidity, loan accounting, collateral locking, liquidation, repayment, and settlement are not implemented. The lending demonstration uses Groq for an advisory proposal and a server-side verifier with fictional, server-owned evidence; demo scenarios are not live collateral or lending transactions.
 
 ## What works today
 
@@ -17,7 +17,7 @@ Trust Trail is a Solana Devnet prototype for owner-controlled mandates and AI-as
 | AI interpretation of native SOL payment requests | Implemented | Server-side Groq structured output. Its result is untrusted and is not authority to execute. |
 | Native SOL payment firewall | Implemented | Decodes the actual unsigned transaction and compares it with the signed intent and current mandate. It does not sign or submit the transaction. |
 | Equity portfolio ownership and valuation | Unavailable | No supported issuer-verified mint or trusted price source is configured. The app does not enumerate the wallet's entire token portfolio. |
-| Lending proposal verification | Fixture-only | Integer/fixed-point verifier and negative tests exist. The UI uses local test data, not live ownership, price, liquidity, policy, or mandate evidence. |
+| Lending assessment | Demonstration plus unavailable live mode | `POST /api/lending/assess` requests an advisory Groq proposal; `POST /api/lending/verify` independently verifies it server-side. Demo mode uses server-owned fictional evidence. Live mode independently reads the selected SPL/SPL-2022 token account and derived native-SOL mandate/vault from Devnet, but lending eligibility remains unavailable. |
 | Lending transaction settlement | Not implemented | Never route lending through the M1 native SOL payment instruction. |
 
 The current Devnet program address is [`7hucMRtxEjUYn9hbKPsByneQmmu4Qrv7qDgaVG59ryEY`](https://explorer.solana.com/address/7hucMRtxEjUYn9hbKPsByneQmmu4Qrv7qDgaVG59ryEY?cluster=devnet). The configured application RPC is checked against Devnet genesis hash `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`.
@@ -37,7 +37,7 @@ The current Devnet program address is [`7hucMRtxEjUYn9hbKPsByneQmmu4Qrv7qDgaVG59
 
 - Node.js and npm compatible with the versions used by this repository's Next.js toolchain
 - For Anchor program builds/tests: Rust toolchain pinned in `rust-toolchain.toml`, Anchor and Solana CLI versions pinned in `Anchor.toml`, and a local Solana test validator
-- A Groq API key is optional for the application. Without it, AI assessment and intent interpretation return an unavailable state.
+- A Groq API key is required for live Groq assessment and native-SOL intent interpretation. Without it, those AI features return an unavailable state; the rest of the application can run.
 
 ### Install and configure
 
@@ -52,10 +52,13 @@ Edit `.env.local` locally:
 # Optional: verified HTTPS RPC endpoint; the app defaults to Solana Devnet.
 NEXT_PUBLIC_SOLANA_RPC_URL=https://api.devnet.solana.com
 
-# Optional; server-side only. Never use a NEXT_PUBLIC_ prefix.
+# Required for live Groq assessment and intent interpretation; server-side only.
 GROQ_API_KEY=
+# Optional; defaults to openai/gpt-oss-20b.
 GROQ_MODEL=openai/gpt-oss-20b
 ```
+
+Production uses the same variables: `GROQ_API_KEY` (required for Groq-backed features), `GROQ_MODEL` (optional; defaults to `openai/gpt-oss-20b`), and `NEXT_PUBLIC_SOLANA_RPC_URL` (optional; defaults to the Solana Devnet endpoint). Never expose `GROQ_API_KEY` through a `NEXT_PUBLIC_` variable.
 
 Keep `.env.local`, wallet keypairs, agent secrets, and encrypted backup exports out of version control. Do not paste secret values into issue reports or logs. The application only accepts HTTPS RPC URLs for browser configuration and verifies that the endpoint is actually Devnet before enabling owner mandate actions.
 
@@ -65,7 +68,7 @@ Keep `.env.local`, wallet keypairs, agent secrets, and encrypted backup exports 
 npm run dev
 ```
 
-Open the local Next.js URL printed by the development server. Connect a wallet to read its mandate account. Owner actions require the verified Devnet connection and wallet approval. The lending fixture flow is local-only and does not sign or submit a transaction.
+Open the local Next.js URL printed by the development server. Connect a wallet to read its mandate account. Owner actions require the verified Devnet connection and wallet approval. The lending demonstration calls Groq for an advisory proposal, then calls the server verifier, which checks the proposal against server-owned fictional evidence. Demo scenarios do not sign or submit transactions.
 
 ## Product flow and security boundaries
 
@@ -81,11 +84,13 @@ The deployed M1 program enforces its supported native SOL mandate instructions o
 
 ### Lending assessment path
 
-- `POST /api/lending/assess` validates a compact opportunity payload and requests a strict Groq proposal. Its response is explicitly advisory and marks settlement as not implemented.
+- `POST /api/lending/assess` validates a compact opportunity payload and requests a Groq proposal. Its response is advisory only and marks settlement as not implemented.
+- `POST /api/lending/verify` independently verifies a proposal on the server. Demo mode uses fictional server-owned evidence. Live mode independently reads the selected SPL or SPL-2022 token account and derived native-SOL mandate/vault from Devnet.
 - `lib/lending.ts` defines a strict proposal schema and integer-only verifier. Collateral valuation, LTV and collateral-ratio decisions use `bigint` fixed-point amounts rather than floating-point authorization arithmetic.
-- The verifier checks supplied evidence and policy. In the current prototype it runs in browser code against caller-supplied evidence; it is not a trusted server or on-chain authorization boundary.
-- The Lending Agent page's demonstration scenarios are fixtures generated locally. They do not contact Groq, RPC, or a wallet and are labeled as simulated.
-- A live implementation still needs a supported issuer/mint registry, verified token-account ownership source, trustworthy timestamped valuation, verified liquidity, borrower eligibility, durable replay and exposure state, and a dedicated lending program or verified protocol integration.
+- Live lending eligibility remains unavailable: no issuer allowlist, trusted valuation, lending policy, borrower registry, or liquidity source is configured. Reading a token account and mandate does not establish eligible collateral or authorize a loan.
+- The current UI demonstration sends a request to Groq and then independently verifies its proposal against server-owned fictional evidence. It is a demonstration, not a live collateral or lending transaction.
+- Replay detection and rate limiting are process-local, neither durable nor shared across server instances. They are not production-grade distributed abuse or replay controls.
+- A live lending implementation still needs trusted issuer, valuation, policy, borrower, liquidity, durable replay/exposure controls, and a dedicated lending settlement boundary.
 
 ### Privacy
 
@@ -150,6 +155,8 @@ programs/tr_mandate/          Anchor/Rust native SOL mandate program
 tests/                        Frontend/unit, local integration, and Anchor tests
 docs/                         Milestone reports, audits, architecture, and demo guide
 ```
+
+Vercel can build this Next.js application with `npm run build` from the repository root; no custom output directory is configured. Normal operation does not depend on local SQLite, a persistent server filesystem, or an always-running process. Browser-side agent backup uses IndexedDB. Process-local rate-limit and replay maps do not persist and are not shared across serverless instances.
 
 ## Project documentation
 

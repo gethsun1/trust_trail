@@ -1,16 +1,16 @@
-# Trust Trail Demo Script
+# Trust Trail Lending Demo Script
 
 ## Current prototype walkthrough
 
 1. Open Trust Trail and point out the Solana Devnet identity banner and the five primary destinations.
-2. Connect Phantom only if owner-authorized mandate actions are being demonstrated. The Overview's equity collateral state should read unavailable, not zero-valued collateral.
-3. Open Portfolio. Explain that the app does not enumerate the full wallet; no issuer-verified equity mint or trusted price source is configured, so ownership and valuation remain unavailable.
-4. Open Lending Agent. Show the fixture selector and explain that its values are test-only, generated locally, and never sent to RPC, Groq or a wallet.
-5. Run the 30% LTV fixture: the fixed-point verifier reports a simulated verification result. This does not establish asset ownership or a real lending decision.
-6. Run Excessive LTV: expect `EXCESSIVE_LTV` (and other relevant policy reasons when inputs trigger them).
-7. Run Unauthorized borrower: expect `UNAUTHORIZED_BORROWER`.
-8. Point out the execution boundary: settlement is not implemented. M1's native SOL payment instruction cannot issue an equity-backed or USDC loan.
-9. Open Mandate and show owner-controlled M1 operations as native SOL only. Existing policy edits, revocation/reactivation and withdrawal remain distinct from lending policy.
-10. If demonstrating M3, use an explicit SOL instruction and explain that its firewall verifies unsigned native SOL payment bytes; it does not sign or submit transactions.
+2. Connect a wallet only if demonstrating owner-authorized mandate actions. M1 controls native SOL only.
+3. Open Portfolio. Explain that the app does not enumerate the full wallet. No issuer allowlist or trusted price source is configured, so live equity eligibility and valuation are unavailable.
+4. Open Lending Agent. Explain that the assessment inputs are fictional demonstration values and that the selected scenarios do not represent collateral or loan transactions.
+5. Run **Valid · 30% LTV**. The browser requests an advisory proposal from Groq through `POST /api/lending/assess`, then submits it to `POST /api/lending/verify`. The server independently verifies it against server-owned fictional evidence.
+6. Expected demo result: `DEMO_VERIFIED`, a recalculated LTV, demonstration-fixture evidence, and `NOT_IMPLEMENTED` settlement. Groq's recommendation remains advisory and is not authority.
+7. Run **Excessive LTV**, **Unauthorized borrower**, and **Stale valuation** to show deterministic negative results from the server verifier.
+8. Explain the live path: verification independently reads the selected SPL/SPL-2022 token account and derived native-SOL mandate/vault from Devnet. Even then, lending eligibility is unavailable without an issuer allowlist, trusted valuation, lending policy, borrower registry, and liquidity source.
+9. Point out that the M1 program controls native SOL only. No tokenized-equity collateral lock, loan settlement, liquidation, or repayment is implemented.
+10. Explain that selective disclosure means data minimization, not cryptographic privacy; Solana account state and RPC queries can be observed.
 
-All lending scenarios above use fixtures. No live equity ownership, valuation, loan, collateral lock or privacy proof is demonstrated.
+The lending walkthrough makes no real collateral, loan, transfer, or lending transaction. Replay detection and rate limiting are process-local and are not shared across server instances.

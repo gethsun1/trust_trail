@@ -1,0 +1,28 @@
+# Local secrets and generated wallet material
+.env
+.env.*
+*.secret
+secrets/
+*.pem
+*.key
+id.json
+*-keypair.json
+*-wallet.json
+wallet.json
+*.seed
+*.mnemonic
+
+# Local validator data and compiled program output
+.anchor/
+.test-ledger/
+test-ledger/
+ledger/
+target/
+**/target/
+
+# Local dependencies and build artifacts
+node_modules/
+.next/
+*.tsbuildinfo
+*.json.tmp
+*.DS_Store
